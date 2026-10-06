@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hotfood-forecast"
+version = "0.1.0"
+description = "Forecast convenience-store hot-food demand to cut waste"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Krishna Annavaram" }]
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26", "pandas>=2.1", "scikit-learn>=1.4"]
+
+[project.optional-dependencies]
+lightgbm = ["lightgbm>=4.0"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+hotfood = "hotfood_forecast.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+filterwarnings = ["ignore:Could not find the number of physical cores:UserWarning"]
