@@ -17,9 +17,11 @@ class _Recorder:
     def __init__(self, real):
         self.real = real
         self.fits = []
+        self.models = []  # keep every model alive so id() values cannot be reused after garbage collection
 
     def __call__(self, *a, **k):
         model = self.real(*a, **k)
+        self.models.append(model)
         fit = model.fit
 
         def recording_fit(rows):
