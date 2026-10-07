@@ -148,7 +148,7 @@ hotfood-forecast/
 ├── data/README.md             # data source, columns, how to get the data (no data files)
 ├── docs/ste-style-guide.md    # writing rules and project vocabulary
 ├── src/hotfood_forecast/      # the package (one module per component, see 2.1)
-├── tests/                     # 59 offline tests on synthetic data
+├── tests/                     # 59 offline tests on synthetic data (1 needs LightGBM)
 ├── .env.example               # variable names only
 ├── pyproject.toml             # dependencies, extras, the hotfood command
 └── LICENSE                    # MIT
