@@ -65,6 +65,7 @@ This README is the **one location that explains all of hotfood-forecast**. It gi
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one forecast](#42-the-life-cycle-of-one-forecast)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [Data validation](#5-data-validation)
 6. 🟢 [Past-only features](#6-past-only-features)
 7. 🟣 [Models and the backtest](#7-models-and-the-backtest)
@@ -128,6 +129,49 @@ flowchart LR
 | Final forecast | `src/hotfood_forecast/forecast.py` | Final model on all observed days, forecast and orders |
 | CLI | `src/hotfood_forecast/cli.py` | The `hotfood` command |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    CLI["cli.py<br/>hotfood command"]
+    subgraph DATAIN["Data in"]
+        CFG["config.py<br/>Settings"]
+        SYN["synthetic.py<br/>generate, write"]
+        DAT["data.py<br/>load_sales, validate_frame"]
+        CAL["calendar.py<br/>get_calendar"]
+        SCH["schema.py<br/>CATEGORIES, PRICE_COLS"]
+    end
+    subgraph FORE["Forecast"]
+        FEA["features.py<br/>build_rows"]
+        MOD["models.py<br/>make_model, MODELS"]
+        BT["backtest.py<br/>run_backtest"]
+        FC["forecast.py<br/>forecast, orders_for_date"]
+    end
+    subgraph DECIDE["Order and score"]
+        NV["newsvendor.py<br/>category_costs, order_quantity"]
+        MET["metrics.py<br/>evaluate, wape_ci"]
+        SIM["simulate.py<br/>simulate"]
+    end
+
+    CLI --> CFG
+    CLI --> SYN
+    CLI --> DAT
+    CLI --> CAL
+    CLI --> NV
+    CLI --> BT
+    CLI --> FC
+    DAT --> SCH
+    BT --> FEA
+    BT --> MOD
+    BT --> NV
+    BT --> MET
+    BT --> SIM
+    FC --> FEA
+    FC --> MOD
+    FC --> NV
+    FEA --> CAL
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -161,6 +205,21 @@ hotfood-forecast/
 ### 3.1 Past-only demand features
 A demand feature reads only units on or before the origin. A calendar feature and the price describe the target date, because the store knows them in advance. `features.py` builds each feature row from array positions that are not after the origin. The test `test_features_do_not_read_after_the_origin` changes all later units and checks that no feature changes.
 
+```mermaid
+flowchart LR
+    subgraph PAST["Days on or before the origin"]
+        U[/"Units of observed days"/] --> D["Demand features<br/>last_obs, mean_7, mean_28, std_28,<br/>same_weekday_last, same_weekday_mean_4"]
+    end
+    subgraph TARGET["Target date = origin + horizon"]
+        C[/"Holiday calendar, date, price"/] --> K["Calendar features<br/>dow_1 to dow_6, month_sin, month_cos,<br/>is_holiday, price"]
+        Y[/"Units of the target date"/] --> T["Target y<br/>NaN if not observed"]
+    end
+    D --> ROW["One feature row<br/>+ horizon"]
+    K --> ROW
+    T --> ROW
+    ROW --> M["Model fit or predict"]
+```
+
 ### 3.2 A direct forecast, no recursion
 Each horizon has its own feature row. The forecast never writes a prediction back into a feature. Thus the calendar features always describe the correct target date.
 
@@ -186,9 +245,10 @@ The order is the demand quantile at the critical ratio of the category. The news
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    F["sales file"] --> V["validate: schema, dates, negatives, duplicates"]
-    V --> FL["flag closure days and calendar gaps"]
+flowchart TD
+    F[/"sales file"/] --> V{"validate: schema, dates, negatives, duplicates"}
+    V -- "error" --> ERR[/"DataValidationError, exit code 2"/]
+    V -- "OK" --> FL["flag closure days and calendar gaps"]
     FL --> FE["feature rows per category, origin and horizon"]
     CAL["holiday calendar"] --> FE
     FE --> BT["rolling-origin backtest"]
@@ -199,13 +259,43 @@ flowchart TB
     M1 --> SC
     M2 --> SC
     SC --> SIM["simulate policies: newsvendor and p50"]
-    FE --> FM["final model on all observed days"]
+    SIM --> REP[("reports/backtest<br/>CSV and summary.json")]
+    REP --> PICK{{"HUMAN<br/>select a model that beats the baselines<br/>HOTFOOD_MODEL or --model"}}
+    PICK --> FM["final model on all observed days"]
+    FE --> FM
     FM --> Q["quantile forecasts for horizons 1..H"]
     Q --> NV["newsvendor order at the critical ratio"]
-    NV --> OUT["order per category and target date"]
+    NV --> OUT[/"order per category and target date"/]
+    OUT --> CHK{{"HUMAN<br/>set the order to 0<br/>for a planned closure"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class PICK,CHK human
 ```
 
 ### 4.2 The life cycle of one forecast
+
+One forecast is one row for a category and a target date.
+
+```mermaid
+stateDiagram-v2
+    state "Feature row" as Row
+    state "Excluded" as Excluded
+    state "Raw quantiles" as Raw
+    state "Sorted quantiles" as Sorted
+    state "Order" as Ordered
+    state "Scored" as Scored
+    state "Shown" as Shown
+    [*] --> Row: build_rows from the origin
+    Row --> Excluded: backtest, target date not observed
+    Row --> Raw: model.predict
+    Raw --> Sorted: sort_quantiles, clip at 0
+    Sorted --> Ordered: order_quantity at the critical ratio
+    Ordered --> Scored: backtest, evaluate and simulate with y
+    Ordered --> Shown: hotfood forecast or order
+    Excluded --> [*]
+    Scored --> [*]
+    Shown --> [*]
+```
 
 1. Load the sales file and validate it.
 2. Flag the closure days and the calendar gaps.
@@ -217,11 +307,66 @@ flowchart TB
 8. Interpolate the quantile at the critical ratio and round up to whole units.
 9. Show the order for each category and target date.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Store manager or analyst
+    participant CLI as hotfood CLI
+    participant DAT as data.py
+    participant NV as newsvendor.py
+    participant BT as backtest.py
+    participant MOD as models.py
+    participant FC as forecast.py
+    participant FS as reports folder
+
+    U->>CLI: hotfood backtest
+    CLI->>CLI: Settings.from_env, get_calendar
+    CLI->>DAT: load_sales(path, calendar flags)
+    DAT-->>CLI: SalesData and ValidationReport
+    CLI->>NV: category_costs(settings, sales)
+    CLI->>BT: run_backtest(sales, models, settings, calendar, costs)
+    loop each category, origin and model
+        BT->>MOD: make_model, fit(train rows)
+        BT->>MOD: predict(test rows)
+        BT->>NV: order_quantity at the critical ratio
+    end
+    BT->>BT: evaluate, wape_ci, simulate
+    BT-->>CLI: BacktestResult
+    CLI->>FS: forecasts.csv, metrics CSV files, policies.csv, summary.json
+    CLI-->>U: accuracy table and policy table
+    U->>CLI: hotfood forecast --model gbm
+    CLI->>FC: forecast(sales, model, settings, calendar, costs)
+    FC->>MOD: fit_final on all observed rows, then predict
+    FC->>NV: order_quantity
+    FC-->>CLI: quantiles, critical_ratio, order
+    CLI-->>U: forecast and orders for horizons 1..H
+```
+
 ---
 
 ## 5. Data validation
 
 **Purpose.** Make sure that the sales file is complete and correct before a model uses it.
+
+```mermaid
+flowchart TD
+    IN[/"Sales CSV"/] --> EX{"File exists?"}
+    EX -- "no" --> FNF[/"FileNotFoundError"/]
+    EX -- "yes" --> COL{"Date and the 4 category<br/>columns present?"}
+    COL -- "no" --> ERR[/"DataValidationError<br/>with the report"/]
+    COL -- "yes" --> DT["_parse_dates<br/>M/D/YYYY or YYYY-MM-DD"]
+    DT --> E1{"Unreadable or duplicate date,<br/>or negative units?"}
+    E1 -- "yes" --> ERR
+    E1 -- "no" --> CALD["Reindex to a complete<br/>daily calendar"]
+    CALD --> FLG["Flag closed and missing days"]
+    FLG --> PR["Prices: fill forward, then backward"]
+    PR --> E2{"Negative price, or fewer than<br/>56 observed days?"}
+    E2 -- "yes" --> ERR
+    E2 -- "no" --> W["Warnings: calendar gaps,<br/>outliers z above 8, holiday differences"]
+    W --> OUT[/"SalesData + ValidationReport"/]
+```
 
 | Input | Output |
 |---|---|
@@ -233,9 +378,9 @@ flowchart TB
 2. Read the dates as `M/D/YYYY` or as `YYYY-MM-DD`.
 3. Stop with an error for unreadable dates, duplicate dates, negative units or negative prices.
 4. Put the rows on a complete daily calendar from the first to the last date.
-5. Flag a day as a closure day if `Closed` is 1, or if all four categories have zero units.
-6. Flag a day as a calendar gap if it has no row or no units.
-7. Fill the prices forward from the last known price.
+5. Flag a day as a closure day if `Closed` is 1. If the file has no `Closed` column, flag a day as a closure day if all four categories have zero units.
+6. Flag a day as a calendar gap if it has no row, or if a unit value is missing on a day that is not a closure day.
+7. Fill the prices forward from the last known price. Fill the days before the first price backward.
 8. Count the outliers with a median-based z-score above 8. Report them and keep them.
 9. Compare the `Is Holiday` column with the holiday calendar and report the differences.
 
@@ -261,6 +406,22 @@ flowchart TB
 ## 6. Past-only features
 
 **Purpose.** Give each model the same leak-free description of the past and of the target date.
+
+```mermaid
+flowchart LR
+    S[/"SalesData, category"/] --> TG["sales.target<br/>NaN on closure days and gaps"]
+    TG --> AR["_demand_arrays<br/>ffill, rolling 7 and 28, weekly means"]
+    O[/"Origins, horizons"/] --> T["target position t = o + h<br/>base = t - 7 x ceil(h / 7)"]
+    AR --> DF["Demand features at o<br/>same-weekday features at base"]
+    T --> DF
+    CAL[/"Holiday calendar"/] --> CF["Calendar features and price at t"]
+    T --> CF
+    DF --> R["build_rows"]
+    CF --> R
+    R --> TR{"Which rows?"}
+    TR -- "training_rows" --> TRO[/"Origins from day 28,<br/>rows with an observed y"/]
+    TR -- "forecast_rows" --> FRO[/"Last date as origin,<br/>y unknown"/]
+```
 
 | Input | Output |
 |---|---|
@@ -300,6 +461,22 @@ flowchart TB
 
 **Purpose.** Score each model on past origins with the procedure that the final forecast uses.
 
+```mermaid
+flowchart TD
+    IN[/"SalesData, models, horizon,<br/>origins, step"/] --> POS["origin_positions<br/>last origin leaves H days"]
+    POS --> SH{"Origin has 28 + 56<br/>days of history?"}
+    SH -- "no" --> DROP["Drop the origin"]
+    DROP --> NONE{"No origin left?"}
+    NONE -- "yes" --> ERR[/"ValueError: data too short"/]
+    SH -- "yes" --> CAT["For each category:<br/>training_rows once"]
+    CAT --> ORI["For each origin:<br/>train = target date not after the origin"]
+    ORI --> TEST["Test rows: build_rows at the origin,<br/>observed target dates only"]
+    TEST --> MDL["For each model:<br/>make_model, fit(train), predict(test)"]
+    MDL --> ORD["order_newsvendor and order_p50"]
+    ORD --> FC[("Forecast table<br/>forecasts.csv")]
+    FC --> SCORE["Score and simulate<br/>per model"]
+```
+
 | Input | Output |
 |---|---|
 | `SalesData`, a list of models, horizon, number of origins, step | Forecast table, metrics per model, per category and per horizon, policy table |
@@ -313,6 +490,22 @@ flowchart TB
 | `ridge` | Pipeline: drop constant columns, median imputation, scaling, `Ridge(alpha=1)` | Residual quantiles from the last 20 % of training rows | Pipeline on training rows |
 | `gbm` | `q0.5` | One `HistGradientBoostingRegressor(loss="quantile")` per quantile | Pipeline on training rows |
 | `lightgbm` | `q0.5` | One `LGBMRegressor(objective="quantile")` per quantile | Optional extra |
+
+```mermaid
+flowchart LR
+    TR[/"Training rows"/] --> K{"Model"}
+    K -- "seasonal_naive" --> SN["Point: same_weekday_last,<br/>else last_obs, else 0"]
+    K -- "weekday_mean" --> WM["Point: same_weekday_mean_4,<br/>else mean_7, else 0"]
+    K -- "ridge" --> RG["Fit on the first 80 % by target date,<br/>point on the last 20 %,<br/>then refit on all rows"]
+    SN --> RES["_fit_residuals: residual quantiles<br/>per horizon, all horizons if fewer than 20 rows"]
+    WM --> RES
+    RG --> RES
+    K -- "gbm or lightgbm" --> GB["One pipeline per quantile:<br/>DropConstant + quantile regressor"]
+    RES --> P["predict: point + residual quantiles"]
+    GB --> P2["predict: one column per quantile"]
+    P --> SQ[/"sort_quantiles<br/>sort each row, clip at 0"/]
+    P2 --> SQ
+```
 
 **Procedure**
 
@@ -338,16 +531,46 @@ flowchart TB
 | MAE | mean of \|y − q0.5\| |
 | RMSE | square root of the mean of (y − q0.5)² |
 | WAPE | sum of \|y − q0.5\| / sum of y, with a 90 % bootstrap interval over target dates |
-| sMAPE | mean of 2 \|y − q0.5\| / (\|y\| + \|q0.5\|), 0 when both are 0 |
+| sMAPE | 100 × mean of 2 \|y − q0.5\| / (\|y\| + \|q0.5\|), 0 when both are 0 (in percent) |
 | Pinball loss | mean over quantiles of max(q (y − ŷ), (q − 1)(y − ŷ)) |
 | Coverage | fraction of y inside [lowest quantile, highest quantile] |
 | Bias | mean of (q0.5 − y) |
+
+```mermaid
+flowchart LR
+    FC[/"Forecast table:<br/>y and quantile columns in the same rows"/] --> G{"Group by"}
+    G -- "model" --> E1["evaluate + wape_ci<br/>bootstrap over target dates, 300 samples"]
+    G -- "model, category" --> E2["evaluate"]
+    G -- "model, horizon" --> E3["evaluate"]
+    G -- "model, policy" --> E4["simulate<br/>order_newsvendor, order_p50"]
+    E1 --> M1[/"metrics.csv<br/>sorted by WAPE"/]
+    E2 --> M2[/"metrics_by_category.csv"/]
+    E3 --> M3[/"metrics_by_horizon.csv"/]
+    E4 --> M4[/"policies.csv<br/>sorted by profit"/]
+```
 
 ---
 
 ## 8. The order decision
 
 The order for a category and a target date is the demand quantile at the critical ratio of the category.
+
+```mermaid
+flowchart TD
+    UP{"HOTFOOD_UNIT_PRICE<br/>set for the category?"} -- "yes" --> P["price = setting"]
+    UP -- "no" --> LP{"Price column<br/>in the file?"}
+    LP -- "yes" --> P2["price = last price"]
+    LP -- "no" --> P3["price = DEFAULT_PRICE 2.0"]
+    P --> UC["unit cost = HOTFOOD_UNIT_COST,<br/>else price x HOTFOOD_COST_RATIO"]
+    P2 --> UC
+    P3 --> UC
+    UC --> V{"price larger than<br/>unit cost?"}
+    V -- "no" --> ERR[/"ValueError"/]
+    V -- "yes" --> CR["CategoryCosts: cu = price - unit cost,<br/>co = unit cost + disposal cost,<br/>critical ratio = cu / (cu + co)"]
+    Q[/"Quantile forecasts of one row"/] --> OQ["order_quantity: np.interp at the ratio,<br/>nearest grid quantile outside the grid"]
+    CR --> OQ
+    OQ --> OUT[/"Order = ceil, whole units, 0 or more"/]
+```
 
 | Value | Formula | Default |
 |---|---|---|
@@ -376,6 +599,16 @@ The order for a category and a target date is the demand quantile at the critica
 | `waste_units`, `waste_rate` | Sum of max(order − units, 0), and waste / ordered |
 | `stockout_units`, `fill_rate` | Sum of max(units − order, 0), and sold / units |
 | `profit` | price × sold − unit cost × ordered − disposal cost × waste |
+
+```mermaid
+flowchart LR
+    IN[/"Backtest rows of one model:<br/>category, y, order column"/] --> NEG{"Negative order?"}
+    NEG -- "yes" --> ERR[/"ValueError"/]
+    NEG -- "no" --> ROW["Each row: sold = min(order, y),<br/>waste = max(order - y, 0),<br/>stock-out = max(y - order, 0)"]
+    C[/"CategoryCosts"/] --> PF["profit = price x sold<br/>- unit cost x order - disposal x waste"]
+    ROW --> PF
+    PF --> SUM[/"Totals: ordered, sold, waste_units, stockout_units,<br/>waste_rate, fill_rate, profit"/]
+```
 
 ---
 
@@ -446,6 +679,17 @@ pytest -q
 | `hotfood demo` | Runs `synth`, `backtest` and `forecast` on synthetic data |
 
 The global option `--horizon N` (1..28) changes the horizon of one run.
+
+`hotfood demo` runs these steps in this order:
+
+```mermaid
+flowchart LR
+    S["synthetic.write<br/>730 days, HOTFOOD_SEED"] --> F[/"reports/demo/<br/>synthetic_sales.csv"/]
+    F --> B["cmd_backtest<br/>4 models, 8 origins, step 14"]
+    B --> R[("reports/demo/backtest")]
+    B --> FC["cmd_forecast<br/>gbm, horizon 7"]
+    FC --> OUT[/"Forecast and orders<br/>on the terminal"/]
+```
 
 ### 10.4 Environment variables
 
